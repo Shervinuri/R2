@@ -1,0 +1,8 @@
+{
+  "name": "Roboshin",
+  "description": "An interactive robot avatar that understands and responds to user chat prompts in Persian, leveraging the Gemini API to provide conversational replies and dynamic facial expressions.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ]
+}
