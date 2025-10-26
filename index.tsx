@@ -506,14 +506,15 @@ const resetPersonalityFunctionDeclaration = { name: 'resetPersonality', paramete
 
 // --- Start of useGeminiLiveSession.ts ---
 const useGeminiLiveSession = ({
-    onExpressionChange, onSpeakingChange, onStatusChange, onNewHistoryItem, onApiKeyInvalid, onPersonalityUpdateRequest, onExportKnowledgeRequest, onResetPersonalityRequest, systemInstruction, voiceName
+    apiKey, onExpressionChange, onSpeakingChange, onStatusChange, onNewHistoryItem, onApiKeyInvalid, onPersonalityUpdateRequest, onExportKnowledgeRequest, onResetPersonalityRequest, systemInstruction, voiceName
 }) => {
-    const sessionPromise = useRef(null);
-    const inputAudioContext = useRef(null);
-    const outputAudioContext = useRef(null);
-    const scriptProcessor = useRef(null);
-    const streamRef = useRef(null);
-    const sources = useRef(new Set());
+// FIX: Explicitly type useRef hooks to prevent type errors. The `sources` ref is typed with `AudioBufferSourceNode` to fix "Property 'stop' does not exist on type 'unknown'".
+    const sessionPromise = useRef<Promise<any> | null>(null);
+    const inputAudioContext = useRef<AudioContext | null>(null);
+    const outputAudioContext = useRef<AudioContext | null>(null);
+    const scriptProcessor = useRef<ScriptProcessorNode | null>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+    const sources = useRef(new Set<AudioBufferSourceNode>());
     const nextStartTime = useRef(0);
 
     const cleanupSessionResources = useCallback(async () => {
@@ -561,6 +562,10 @@ const useGeminiLiveSession = ({
 
 
     const startSession = useCallback(async () => {
+        if (!apiKey) {
+            onApiKeyInvalid();
+            return;
+        }
         onStatusChange('connecting');
 
         // Step 1: Handle microphone permissions explicitly
@@ -580,7 +585,7 @@ const useGeminiLiveSession = ({
 
         // Step 2: Initialize Gemini AI and connect
         try {
-            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+            const ai = new GoogleGenAI({ apiKey });
             
             const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
             if (!AudioContext) {
@@ -633,11 +638,11 @@ const useGeminiLiveSession = ({
                             if (message.serverContent?.interrupted) { sources.current.forEach(s => s.stop()); sources.current.clear(); nextStartTime.current = 0; onSpeakingChange(false); }
 
                             if (message.toolCall) {
-                               const toolAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
+                               const toolAi = new GoogleGenAI({ apiKey });
                                
                                const handleToolError = (error, toolName) => {
                                    console.error(`${toolName} failed:`, error);
-                                   if (error.message?.includes("Requested entity was not found")) { onApiKeyInvalid(); stopSession(); return true; }
+                                   if (error.message?.includes("Requested entity was not found") || error.message?.includes("API key not valid")) { onApiKeyInvalid(); stopSession(); return true; }
                                    
                                    if (error.message?.includes('429') || error.message?.includes('RESOURCE_EXHAUSTED')) {
                                        const utterance = new SpeechSynthesisUtterance("وای عزیزم! انگار یکم سرم شلوغه الان. چند بار سعی کردم ولی نشد. لطفاً یه کم دیگه دوباره امتحان کن، باشه؟");
@@ -767,14 +772,15 @@ const useGeminiLiveSession = ({
             onStatusChange('error');
             await cleanupSessionResources();
         }
-    }, [onStatusChange, stopSession, onSpeakingChange, onExpressionChange, onNewHistoryItem, cleanupSessionResources, onApiKeyInvalid, onPersonalityUpdateRequest, onExportKnowledgeRequest, onResetPersonalityRequest, systemInstruction, voiceName]);
+    }, [apiKey, onStatusChange, stopSession, onSpeakingChange, onExpressionChange, onNewHistoryItem, cleanupSessionResources, onApiKeyInvalid, onPersonalityUpdateRequest, onExportKnowledgeRequest, onResetPersonalityRequest, systemInstruction, voiceName]);
 
     return { startSession, stopSession, sendRealtimeInput };
 };
 
 // Main App Component
 const App = () => {
-    const [hasApiKey, setHasApiKey] = useState(false);
+    const [apiKey, setApiKey] = useState(null);
+    const [isStudioEnv, setIsStudioEnv] = useState(false);
     const [isCheckingApiKey, setIsCheckingApiKey] = useState(true);
     const [status, setStatus] = useState('idle');
     const [isSpeaking, setIsSpeaking] = useState(false);
@@ -823,12 +829,24 @@ const App = () => {
     useEffect(() => {
         const checkApiKey = async () => {
             setIsCheckingApiKey(true);
-            try {
-                if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
-                    setHasApiKey(await window.aistudio.hasSelectedApiKey());
-                } else { setHasApiKey(true); }
-            } catch (e) { console.error("API key check failed", e); setHasApiKey(true); }
-            finally { setIsCheckingApiKey(false); }
+            const isStudio = window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function';
+            setIsStudioEnv(isStudio);
+
+            if (isStudio) {
+                try {
+                    const hasKey = await window.aistudio.hasSelectedApiKey();
+                    // In AI Studio, the key is handled by the environment. We use a placeholder to signify it exists.
+                    setApiKey(hasKey ? 'aistudio_key_placeholder' : null);
+                } catch (e) {
+                     console.error("AI Studio API key check failed", e);
+                     setApiKey(null);
+                }
+            } else {
+                // In other environments (like Netlify), check localStorage.
+                const savedKey = localStorage.getItem('gemini-api-key');
+                setApiKey(savedKey);
+            }
+            setIsCheckingApiKey(false);
         };
         checkApiKey();
     }, []);
@@ -852,16 +870,21 @@ const App = () => {
         try {
             if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
                 await window.aistudio.openSelectKey();
-                setHasApiKey(true);
+                setApiKey('aistudio_key_placeholder'); // Assume success
             }
         } catch (e) { console.error("Could not open API key selection:", e); }
     };
 
     const onApiKeyInvalid = useCallback(() => {
-        setHasApiKey(false);
+        if (isStudioEnv) {
+            setApiKey(null);
+        } else {
+            localStorage.removeItem('gemini-api-key');
+            setApiKey(null);
+        }
         setStatus('error'); 
-        alert("کلید API شما نامعتبر است. لطفاً یک کلید معتبر انتخاب کنید.");
-    }, []);
+        alert("کلید API شما نامعتبر است. لطفاً یک کلید معتبر انتخاب یا وارد کنید.");
+    }, [isStudioEnv]);
     
     const onExpressionChange = useCallback((exp) => {
         setTemporaryExpression(exp);
@@ -906,7 +929,10 @@ const App = () => {
          onNewHistoryItem({ id: Date.now(), type: 'code', data: { language: 'json', code: jsonString } });
     };
 
+    const effectiveApiKey = isStudioEnv ? process.env.API_KEY : apiKey;
+
     const { startSession, stopSession, sendRealtimeInput } = useGeminiLiveSession({
+        apiKey: effectiveApiKey,
         onExpressionChange,
         onSpeakingChange: setIsSpeaking,
         onStatusChange: setStatus,
@@ -930,10 +956,10 @@ const App = () => {
             return;
         }
         // If the session was stopped for a personality update, this effect will restart it.
-        if (status === 'idle') {
+        if (status === 'idle' && apiKey) {
            startSession();
         }
-    }, [personalityConfig, startSession, status]);
+    }, [personalityConfig, startSession, status, apiKey]);
 
     const handleTextSubmit = useCallback((text) => {
         onNewHistoryItem({ id: Date.now(), type: 'userText', data: { text } });
@@ -1004,7 +1030,7 @@ const App = () => {
         </div>
     );
     
-    const ApiKeyScreen = ({ onSelectKey }) => (
+    const AiStudioApiKeyScreen = ({ onSelectKey }) => (
         <div className="flex flex-col items-center justify-center text-center p-8 space-y-6 animate-fade-in-up">
             <h1 className="text-3xl font-bold">به روبوشین خوش آمدید!</h1>
             <p className="text-gray-300 max-w-md">برای شروع گفتگو با روبوشین، لطفاً یک کلید API از پروژه Google AI Studio خود انتخاب کنید.</p>
@@ -1014,27 +1040,60 @@ const App = () => {
             <button onClick={onSelectKey} className="px-6 py-3 bg-cyan-500 hover:bg-cyan-600 text-white font-bold rounded-lg shadow-lg transition-transform transform hover:scale-105">انتخاب کلید API</button>
         </div>
     );
+    
+    const ApiKeyInputScreen = ({ onApiKeySet }) => {
+        const [inputKey, setInputKey] = useState('');
+        const handleSave = () => {
+            if (inputKey.trim()) {
+                localStorage.setItem('gemini-api-key', inputKey.trim());
+                onApiKeySet(inputKey.trim());
+            }
+        };
+        const handleKeyDown = (e) => { if (e.key === 'Enter') { handleSave(); } };
+        return (
+            <div className="flex flex-col items-center justify-center text-center p-8 space-y-6 animate-fade-in-up">
+                <h1 className="text-3xl font-bold">به روبوشین خوش آمدید!</h1>
+                <p className="text-gray-300 max-w-md">برای شروع گفتگو، لطفاً کلید Gemini API خود را وارد کنید. کلید شما در مرورگرتان ذخیره خواهد شد.</p>
+                <input type="password" value={inputKey} onChange={(e) => setInputKey(e.target.value)} onKeyDown={handleKeyDown} className="px-4 py-2 w-full max-w-sm bg-gray-900 border border-gray-700 rounded-lg text-white text-center focus:ring-2 focus:ring-cyan-500 focus:outline-none" placeholder="کلید API خود را اینجا وارد کنید" />
+                <p className="text-xs text-gray-500">
+                    <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-cyan-400 hover:underline">کلید API خود را از اینجا دریافت کنید</a>
+                </p>
+                <button onClick={handleSave} className="px-6 py-3 bg-cyan-500 hover:bg-cyan-600 text-white font-bold rounded-lg shadow-lg transition-transform transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed" disabled={!inputKey.trim()}>
+                    ذخیره و شروع گفتگو
+                </button>
+            </div>
+        );
+    };
+
 
     if (isCheckingApiKey) {
-        return <div className="flex-grow flex items-center justify-center"><p>Loading...</p></div>;
+        return <div className="flex-grow flex items-center justify-center"><p>در حال بارگذاری...</p></div>;
     }
+
+    const renderContent = () => {
+        if (!apiKey) {
+            if (isStudioEnv) {
+                return <AiStudioApiKeyScreen onSelectKey={handleSelectKey} />;
+            }
+            return <ApiKeyInputScreen onApiKeySet={setApiKey} />;
+        }
+        return (
+            <>
+                <div className="shrink-0 pt-8 text-center">
+                    <RobotFace expression={expression} onClick={handleFaceClick} />
+                    <p className="text-gray-400 text-lg animate-fade-in-up transition-all duration-300 h-6 mt-4" key={currentStatusText}>
+                        {currentStatusText}
+                    </p>
+                </div>
+                <ConversationHistory />
+            </>
+        );
+    };
 
     return (
         <>
             <main className="flex-grow w-full flex flex-col items-center p-4">
-                 {!hasApiKey ? (
-                    <ApiKeyScreen onSelectKey={handleSelectKey} />
-                ) : (
-                    <>
-                        <div className="shrink-0 pt-8 text-center">
-                            <RobotFace expression={expression} onClick={handleFaceClick} />
-                            <p className="text-gray-400 text-lg animate-fade-in-up transition-all duration-300 h-6 mt-4" key={currentStatusText}>
-                                {currentStatusText}
-                            </p>
-                        </div>
-                        <ConversationHistory />
-                    </>
-                )}
+                 {renderContent()}
             </main>
             <footer className="w-full text-center p-4 text-sm shrink-0">
                 <a href="https://t.me/shervini" target="_blank" rel="noopener noreferrer" className="wavy-gradient">
